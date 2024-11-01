@@ -1,0 +1,12 @@
+name|type|data|command|depend|seed|path|time|size|bytes|format|repository|iteration|parent|children|seconds|warnings|error
+auth_gs|function|a0bde0490df751a8|||||||||||||||
+games_file|stem|f9989a45ea0c6302|c3c7d856184b3e1b|2c530c1562a7fbd1|-1509610231|data/raw/games_ranked.rds|t20028.6737342179s|9f573c8974d1ee5a|25555614|file|local|vector|||0||
+games_raw|stem|5d1e740c909e7595|468fb4c405e73cd9|9c689220dbff9516|-450562005||t20028.68975102s|6af7675ea7269923|23078676|qs|local|vector|||1.594||
+googlesheets_url|function|e3812b9d4926f711|||||||||||||||
+interaction_raw|stem|bf25ac60ddde3b2c|efa85a79d065ce05|da77c63918da0f9b|255547836||t20028.6897232922s|1faa87a30dbb6511|12457|qs|local|vector|||0.737||
+load_games|function|d6edcfcbcccbb3d7|||||||||||||||
+load_interaction_table|function|2214026af03504c0|||||||||||||||
+load_responses|function|e5a09ce2eb0f0174|||||||||||||||
+object|object|b977c7e7b33bc4b2|||||||||||||||
+responses|stem|74cc1a1a3355cba7|a5a928ce32455b6e|f5c3f0b3b8dd559c|2113815317||t20028.6897144751s|d0fa7718175c76ec|57311|qs|local|vector|||2.457||
+responses_summary|stem|6ba48b36e3b2706b|01676cd7f6c23b31|5bfbabde18e73a7d|-1384619494||t20028.6897234387s|5e9cba811eac3a1d|7183|qs|local|vector|||0.007||
