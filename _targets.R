@@ -23,27 +23,38 @@ tar_option_set(
 list(
   tar_target(
     name = responses,
-    command = load_responses()
+    load_responses()
   ),
   tar_target(
     name = interaction_raw,
-    command = load_interaction_table()
+    load_interaction_table()
   ),
   tar_target(
-    name = games_file, "data/raw/games_ranked.rds", format = "file"
+    name = interaction_table,
+    interaction_raw |>
+      tidy_interaction_table()
+  ),
+  tar_target(
+    name = games_file, 
+    "data/raw/games_ranked.rds", 
+    format = "file"
   ),
   tar_target(
     name = games_raw,
-    command = load_games(file = games_file)
+    load_games(file = games_file)
   ),
   tar_target(
-    responses_summary,
-    responses |>
-    group_by(name)  |>
-    summarize(
-      mean = mean(response_rating, na.rm = T),
-      sd = sd(response_rating, na.rm = T),
-      votes = sum(!is.na(response_rating))
-    )
+    name = games_preprocessed,
+    games_raw |> bggUtils::preprocess_bgg_games()
+  ),
+  tar_target(
+    interaction_estimates,
+    interaction_table |>
+      select(name, interaction = mean) |>
+      mutate(
+        name = case_when(name == 'Welcome To…' ~ "Welcome To...",
+                         name == 'Railroad Ink' ~ 'Railroad Ink: Deep Blue Edition',
+                         TRUE ~ name)
+      )
   )
 )

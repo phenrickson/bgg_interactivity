@@ -1,0 +1,461 @@
+---
+title: "Analyzing Interactivity"
+format: 
+  html:
+    warning: false
+    message: false
+editor: source
+---
+
+# Data
+
+<!-- # ```{r} -->
+<!-- # #| include: false -->
+<!-- # targets::tar_load_globals() -->
+<!-- #  -->
+<!-- # ``` -->
+<!-- #  -->
+
+```{r}
+#| warning: false
+#| message: false
+#| 
+# packages
+library(tidyverse)
+library(bggUtils)
+library(ggforce)
+library(gt)
+library(gtExtras)
+
+# functions
+targets::tar_source("R")
+
+# data
+# survey responses
+responses = targets::tar_read("responses")
+interaction_table = targets::tar_read("interaction_table")
+
+# games
+games_raw = targets::tar_read("games_raw")
+games_preprocessed = targets::tar_read("games_preprocessed")
+
+# ggplot theme
+theme_set(bggUtils::theme_bgg())
+
+```
+
+## Responses
+
+The responses data has one record for each game from a respondent, with a rating ranging from 1 to 5.
+
+```{r}
+
+set.seed(10)
+responses |>
+  filter(!is.na(response_rating)) |>
+  mutate(response_ts = as.Date(response_ts)) |>
+  sample_n(15) |>
+  gt_tbl()
+```
+
+
+```{r}
+
+responses |>
+  format_as_table() |>
+  arrange(desc(n)) |>
+  select(name, starts_with("rating_"), everything()) |>
+  gt_ratings_tbl()
+
+```
+
+To see these games at a glance, I'll plot the proportion of votes for each rating for all games, ranking them from most interactive to least interactive.
+
+```{r}
+#| fig-height: 10
+responses |>
+  format_as_table() |>
+  plot_responses_count()
+
+```
+
+
+
+```{r}
+
+responses |>
+  group_by(name) |>
+  summarize_responses() |>
+  plot_mean_vs_sd()
+
+```
+
+## Table
+
+The responses are slightly different than data shown in the `Interaction Table` sheet, which has more responses from, I'm guessing, previous surveys? Nonetheless this can be analyzed in a similar fashion.
+
+```{r}
+
+interaction_table |>
+  gt_ratings_tbl()
+
+```
+
+
+```{r}
+#| fig-height: 10
+interaction_table |>
+  plot_responses_count()
+
+```
+
+```{r}
+
+interaction_table |>
+  plot_mean_vs_sd()
+
+```
+
+# Analysis
+
+This survey gives us a measure of interactivity for a couple hundred games, but we'd really like to produce a rating for all games on BGG.
+
+For instance, we have community measures from BGG regarding the complexity of games (average weight rating), along with a community's assessment of how *good* a game is (average user rating).
+
+```{r}
+#| message: false
+#| warning: false
+plot_bgg_ratings = 
+  games_preprocessed |>
+  ggplot(aes(x=averageweight, y=average))+
+  geom_point(alpha = 0.25,size = 0.5, position = ggforce::position_jitternormal())+
+  xlab("average weight")+
+  ylab("average rating")
+
+plot_bgg_ratings
+
+```
+
+I'll join up the dataset of all (ranked) BGG games with the games for which we have an interactivity rating. This is a much smaller sample, but I'll highlight these games on the previous graph. This highlights that the sample of games with an interactive rating are spread out pretty well across complexity, though most (understandably) are also games with a higher than average BGG rating. 
+
+```{r}
+
+plot_bgg_ratings +
+  geom_point(data = games_preprocessed |>
+               select(game_id, name, average, averageweight, usersrated) |>
+               inner_join(interaction_table |> 
+                            select(name, interactivity = mean)),
+             color = 'blue')
+
+```
+
+## Methodology
+
+How can we get an interactivity rating for games other than the ones shown in blue? The simplest answer is to just collect a bunch of data - get the community to respond to surveys and rate all of the games!
+
+That's going to be difficult to accomplish, so my approach is to *estimate* the interactivity for all of these other games using the ratings we have in our sample. To do this, I will attempt to train a model to learn the relationship between attributues of games (as taken from BGG) and the interaction rating. If a model can learn how to predict this rating, we can then use the resulting model to estimate the interactive rating for games the community has not yet rated. These estimates can then be used to guide our labeling strategy for new games, which can then be fed back into the model, and so on.
+
+This requires first assessing our ability to predict the interactive rating using information from BGG.
+
+1. Train a model to predict interactivity as a function 
+2. Assess model's performance via resampling.
+3. Predict interactivity for all other games
+4. Use predictions to guide labeling strategy for other games
+5. Repeat
+
+```{r}
+#| message: false
+#| warning: false
+targets::tar_load(interaction_estimates)
+
+games_and_interaction = 
+  games_preprocessed |>
+  group_by(name) |>
+  slice_max(usersrated, n =1) |>
+  ungroup() |>
+  inner_join(
+    interaction_estimates
+  )
+
+```
+
+We are in a very small data setting, which means we need to be careful in how we spend our data. Ultimately, the goal is to develop a model to predict the interactivity of games that do not have a rating, where we can trust that our model predicts this rating reasonably well. This means we need to assess how well a model can perform on unseen data.
+
+To this end, I will create a train/validation split for games with interaction ratings. I will use the training set to develop a model and the validation set to assess its performance in predicting games not used in training the model.
+
+```{r}
+
+library(tidymodels)
+library(glmnet)
+library(rstanarm)
+library(mixOmics)
+library(tailor)
+
+tidyverse::tidyverse_conflicts()
+tidymodels::tidymodels_prefer()
+
+
+set.seed(1999)
+split = 
+  games_and_interaction |>
+  initial_split(strata = interaction)
+
+set.seed(1999)
+folds = 
+  split |>
+  training() |>
+  vfold_cv(v = 5, strata = interaction, repeats = 3)
+
+```
+
+## Preprocessing
+
+What might predict a game's interactive rating? I have a very rich set features for games, including everything from player counts, playing time, publishers, mechanics, categories, components, and so on. It would be tempting to take the kitchen sink approach and throw everything into a model and see what we get, but given that we have such a small dataset I would prefer to start with small set of features that we think would explain interactivity and add from there. 
+
+My expectation is that player counts and playing time will play a role, along with 
+
+```{r}
+
+# recipe with very mininal features
+baseline_recipe = 
+  split |>
+  training() |>
+  build_recipe(outcome = interaction,
+               ids = c("game_id", "name", "yearpublished"),
+               predictors = c("minplayers", 
+                              "maxplayers",
+                              "playingtime",
+                              "maxplaytime",
+                              "minplaytime",
+                              "minage")
+  ) |>
+  step_playingtime_and_playercount() |>
+  step_playercounts(threshold = 50) |>
+  add_zv()
+
+# expanded recipe
+full_recipe = 
+  split |>
+  training() |>
+  build_recipe(outcome = interaction,
+               ids = c("game_id", "name", "yearpublished"),
+               predictors = c("minplayers", 
+                              "maxplayers",
+                              "playingtime",
+                              "maxplaytime",
+                              "minplaytime",
+                              "minage",
+                              "mechanics",
+                              "categories",
+                              "averageweight")
+  ) |>
+  step_playingtime_and_playercount() |>
+  step_playercounts(threshold = 50) |>
+  step_count_items(mechanics, categories) |>
+  # step_impute_linear(averageweight, impute_with = imp_vars(time_per_player, number_mechanics)) |>
+  add_dummies(mechanics, threshold = 25) |>
+  add_dummies(categories, threshold = 25) |>
+  add_zv() |>
+  add_normalize()
+
+# pca
+pca_recipe = 
+  full_recipe |>
+  step_pca(all_numeric_predictors(), id = "pca", threshold = .50)
+
+# pls
+pls_recipe = 
+  full_recipe |>
+  step_pls(all_numeric_predictors(), outcome = "interaction", id = "pls", num_comp = 5)
+
+
+```
+
+Now create model specifications. I'll use models in the linear family for now, given the amount of data we have.
+
+```{r}
+
+lm_mod = linear_reg()
+#stan_mod = linear_reg(engine = "stan")
+glmnet_mod = linear_reg(engine = "glmnet", penalty = 0.001)
+
+```
+
+
+```{r}
+
+wflows = 
+  workflowsets::workflow_set(preproc = list("baseline"  = baseline_recipe,
+                                            "full" = full_recipe,
+                                            "pca" = pca_recipe,
+                                            "pls" = pls_recipe),
+                             models = list("lm" = lm_mod,
+                                           #  "stan" = stan_mod,
+                                           "glmnet" = glmnet_mod)
+  ) |>
+  anti_join(
+    tibble(wflow_id = c("pls_glmnet", "pca_glmnet")),
+    by = "wflow_id"
+  )
+```
+
+I'll now examine how these perform during resampling.
+
+```{r}
+
+models = 
+  wflows |>
+  workflow_map(fn = "fit_resamples",
+               resamples = folds,
+               verbose = T,
+               control = control_grid(save_pred = T, save_workflow = T)
+  )
+
+```
+Plot the results
+
+```{r}
+
+autoplot(models, type = "wflow_id")
+
+```
+
+Examine performance
+
+```{r}
+
+
+models |>
+  collect_metrics(summarize = T)  |>
+  arrange(.metric) |>
+  gt_tbl() |>
+  gt::fmt_number(columns = c("mean", "std_err"), decimals = 3)
+```
+
+Examine predictions
+
+```{r}
+
+models |>
+  collect_predictions(summarize = T) |>
+  left_join(
+    split |>
+      training() |>
+      mutate(.row = row_number()) |>
+      select(game_id, name, .row)
+  ) |>
+  select(wflow_id, game_id, name, .row, .pred, interaction) |>
+  ggplot(aes(x=.pred, y=interaction))+
+  geom_point()+
+  facet_wrap(~wflow_id)+
+  theme_bw()+
+  ggpubr::stat_cor()+
+  geom_abline(slope = 1, linetype = 'dashed')
+
+
+```
+
+Examine the models
+
+```{r}
+
+best_mod = 
+  models |>
+  fit_best() |>
+  add_tailor(tailor() %>%
+               adjust_numeric_range(lower_limit = 1, upper_limit = 5)
+  )
+
+best_mod |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  ggplot(aes(y=reorder(term, estimate),
+             x=estimate))+
+  geom_col()
+
+```
+
+Predict validation set
+
+```{r}
+
+best_mod |>
+  augment(
+    split |>
+      testing()
+  ) |>
+  ggplot(aes(x=.pred, y=interaction, label = name))+
+  geom_point()+
+  geom_text(size = 1.5, vjust = 1.5)+
+  tune::coord_obs_pred()
+
+
+```
+
+```{r}
+
+best_mod |>
+  augment(
+    split |>
+      testing()
+  ) |>
+  yardstick::rmse(
+    truth = interaction,
+    .pred
+  )
+
+```
+
+```{r}
+
+best_mod |>
+  augment(
+    split |>
+      testing()
+  ) |>
+  select(game_id, name, .pred, interaction) |>
+  mutate_if(is.numeric, round, 3) |>
+  arrange(desc(interaction))
+
+```
+
+
+```{r}
+
+best_fit = 
+  best_mod |>
+  fit(
+    split$data
+  )
+
+
+```
+
+
+```{r}
+
+estimates = 
+  best_fit |>
+  predict(
+    games_preprocessed |>
+      filter(!is.na(averageweight))
+  ) |>
+  bind_cols(
+    games_preprocessed |>
+      filter(!is.na(averageweight))
+  )
+
+```
+
+
+```{r}
+
+estimates |>
+  select(game_id, name, averageweight, interaction = .pred) |>
+  ggplot(aes(x=averageweight, y=interaction, label = name))+
+  geom_point(alpha = 0.25, size = 1, position = ggforce::position_jitternormal())+
+  geom_text(check_overlap = T, size = 1.5)
+  
+
+```
+
