@@ -54,17 +54,8 @@ predictor_vars = function(vars =
 ) {vars}
 
 id_vars = function(vars =
-                     c("game_id",
-                       "name",
-                       "username",
-                       "numweights",
-                       "yearpublished",
-                       "averageweight",
-                       "average",
-                       "usersrated",
-                       "image",
-                       "thumbnail",
-                       "description")) {vars}
+                     c("game_id", "name", "yearpublished")) 
+  {vars}
 
 # spline_vars = function(vars = c("number_mechanics",
 #                                 "number_categories")) {vars}
@@ -224,10 +215,12 @@ step_playingtime_and_playercount = function(recipe) {
     # log
     step_log(time_per_player,
              playingtime,
-             offset = 1)
+             offset = 1) |>
+    step_rm(minplaytime, maxplaytime)
 }
 
-step_playercounts = function(recipe, threshold = 1) {
+# try dummy for playercounts?
+step_dummy_playercounts = function(recipe, threshold = 1) {
   
   recipe |>
     step_mutate(player_counts = map2_vec(minplayers, maxplayers, ~ paste(seq(.x, .y), collapse = ","))) |>

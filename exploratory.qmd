@@ -1,0 +1,809 @@
+---
+title: "Analyzing Interactivity"
+format: 
+  html:
+    warning: false
+    message: false
+editor: source
+---
+
+# Data
+
+<!-- # ```{r} -->
+<!-- # #| include: false -->
+<!-- # targets::tar_load_globals() -->
+<!-- #  -->
+<!-- # ``` -->
+<!-- #  -->
+
+```{r}
+#| warning: false
+#| message: false
+#| 
+# packages
+library(tidyverse)
+library(bggUtils)
+library(ggforce)
+library(gt)
+library(gtExtras)
+
+# functions
+targets::tar_source("R")
+
+# data
+# survey responses
+responses = targets::tar_read("responses")
+interaction_table = targets::tar_read("interaction_table")
+
+# games
+games_raw = targets::tar_read("games_raw")
+games_preprocessed = targets::tar_read("games_preprocessed")
+
+# ggplot theme
+theme_set(bggUtils::theme_bgg())
+
+```
+
+## Responses
+
+The responses data has one record for each game from a respondent, with a rating ranging from 1 to 5.
+
+```{r}
+
+set.seed(10)
+responses |>
+  filter(!is.na(response_rating)) |>
+  mutate(response_ts = as.Date(response_ts)) |>
+  sample_n(15) |>
+  gt_tbl()
+```
+
+
+```{r}
+
+responses |>
+  format_as_table() |>
+  arrange(desc(n)) |>
+  select(name, starts_with("rating_"), everything()) |>
+  gt_ratings_tbl()
+
+```
+
+To see these games at a glance, I'll plot the proportion of votes for each rating for all games, ranking them from most interactive to least interactive.
+
+```{r}
+#| fig-height: 10
+responses |>
+  format_as_table() |>
+  plot_responses_count()
+
+```
+
+
+
+```{r}
+
+responses |>
+  group_by(name) |>
+  summarize_responses() |>
+  plot_mean_vs_sd()
+
+```
+
+## Table
+
+The responses are slightly different than data shown in the `Interaction Table` sheet, which has more responses from, I'm guessing, previous surveys? Nonetheless this can be analyzed in a similar fashion.
+
+```{r}
+
+interaction_table |>
+  gt_ratings_tbl()
+
+```
+
+
+```{r}
+#| fig-height: 10
+interaction_table |>
+  plot_responses_count()
+
+```
+
+```{r}
+
+interaction_table |>
+  plot_mean_vs_sd()
+
+```
+
+# Analysis
+
+This survey gives us a measure of interactivity for a couple hundred games, but we'd really like to produce a rating for all games on BGG.
+
+For instance, we have community measures from BGG regarding the complexity of games (average weight rating), along with a community's assessment of how *good* a game is (average user rating).
+
+```{r}
+#| message: false
+#| warning: false
+plot_bgg_ratings = 
+  games_preprocessed |>
+  ggplot(aes(x=averageweight, y=average))+
+  geom_point(alpha = 0.25,size = 0.5, position = ggforce::position_jitternormal())+
+  xlab("average weight")+
+  ylab("average rating")
+
+plot_bgg_ratings
+
+```
+
+I'll join up the dataset of all (ranked) BGG games with the games for which we have an interactivity rating. This is a much smaller sample, but I'll highlight these games on the previous graph. This highlights that the sample of games with an interactive rating are spread out pretty well across complexity, though most (understandably) are also games with a higher than average BGG rating. 
+
+```{r}
+
+plot_bgg_ratings +
+  geom_point(data = games_preprocessed |>
+               select(game_id, name, average, averageweight, usersrated) |>
+               inner_join(interaction_table |> 
+                            select(name, interactivity = mean)),
+             color = 'blue')
+
+```
+
+## Methodology
+
+How can we get an interactivity rating for games other than the ones shown in blue? The simplest answer is to just collect a bunch of data - get the community to respond to surveys and rate all of the games!
+
+That's going to be difficult to accomplish, so my approach is to *estimate* the interactivity for all of these other games using the ratings we have in our sample. To do this, I will attempt to train a model to learn the relationship between attributues of games (as taken from BGG) and the interaction rating. If a model can learn how to predict this rating, we can then use the resulting model to estimate the interactive rating for games the community has not yet rated. These estimates can then be used to guide our labeling strategy for new games, which can then be fed back into the model, and so on.
+
+This requires first assessing our ability to predict the interactive rating using information from BGG.
+
+1. Train a model to predict interactivity as a function of BGG features.
+2. Assess model performance via resampling and hold-out set.
+3. Use model to predict games that do not have interactivity rating.
+4. Use model predictions to guide labeling strategy for games without interactivity rating.
+5. Go back to step 1 with expanded/updated interactivity rating
+6. Repeat 1-4
+
+
+```{r}
+#| message: false
+#| warning: false
+targets::tar_load(interaction_estimates)
+
+games_and_interaction = 
+  games_preprocessed |>
+  group_by(name) |>
+  slice_max(usersrated, n =1) |>
+  ungroup() |>
+  inner_join(
+    interaction_estimates
+  )
+
+```
+
+We are in a very small data setting, which means we need to be careful in how we spend our data. Ultimately, the goal is to develop a model to predict the interactivity of games that do not have a rating, where we can trust that our model predicts this rating reasonably well. This means we need to assess how well a model can perform on unseen data.
+
+To this end, I will create a train/validation split for games with interaction ratings. I will use the training set to develop a model and the validation set to assess its performance in predicting games not used in training the model.
+
+```{r}
+
+library(tidymodels)
+library(glmnet)
+library(rstanarm)
+library(mixOmics)
+library(tailor)
+
+tidyverse::tidyverse_conflicts()
+tidymodels::tidymodels_prefer()
+
+
+set.seed(1999)
+split = 
+  games_and_interaction |>
+  initial_split(strata = interaction)
+
+set.seed(1999)
+folds = 
+  split |>
+  training() |>
+  vfold_cv(v = 5, strata = interaction, repeats = 3)
+
+```
+
+## Preprocessing
+
+What might predict a game's interactive rating? I have a very rich set features for games, including everything from player counts, playing time, publishers, mechanics, categories, components, and so on. It would be tempting to take the kitchen sink approach and throw everything into a model and see what we get, but given that we have such a small dataset I would prefer to start with small set of features that we think would explain interactivity and add from there. 
+
+My expectation is that player counts and playing time will play a role, along with certain types of mechanics and categories. I'll create a couple of different recipes, or preprocessors, that will generate different sets of features.
+
+```{r}
+
+# recipe with very minimal set of features features
+baseline_recipe = 
+  split |>
+  training() |>
+  build_recipe(outcome = interaction,
+               predictors = c("minplayers", 
+                              "maxplayers",
+                              "playingtime",
+                              "maxplaytime",
+                              "minplaytime",
+                              "minage")
+  ) |>
+  step_playingtime_and_playercount() |>
+  # step_playercounts(threshold = 50) |>
+  add_zv()
+
+# expanded features; adding in mechanics and categoreis
+expanded_recipe = 
+  split |>
+  training() |>
+  build_recipe(outcome = interaction,
+               predictors = c("minplayers", 
+                              "maxplayers",
+                              "playingtime",
+                              "maxplaytime",
+                              "minplaytime",
+                              "minage",
+                              "mechanics",
+                              "categories")
+  ) |>
+  step_playingtime_and_playercount() |>
+  step_count_items(mechanics, categories) |>
+  add_dummies(mechanics, threshold = 15) |>
+  add_dummies(categories, threshold = 15)
+
+# normalize
+norm_recipe = 
+  expanded_recipe |>
+  add_zv() |>
+  add_normalize()
+
+
+# trying out playercount dummies? idk
+playercounts_recipe = 
+  split |>
+  training() |>
+  build_recipe(outcome = interaction,
+               predictors = c("minplayers", 
+                              "maxplayers",
+                              "playingtime",
+                              "maxplaytime",
+                              "minplaytime",
+                              "minage",
+                              "mechanics",
+                              "categories")
+  ) |>
+  step_playingtime_and_playercount() |>
+  step_dummy_playercounts(threshold = 50) |>
+  step_count_items(mechanics, categories) |>
+  add_dummies(mechanics, threshold = 15) |>
+  add_dummies(categories, threshold = 15) |>
+  add_zv() |>
+  add_normalize()
+
+# pca
+pca_recipe = 
+  norm_recipe |>
+  step_pca(all_numeric_predictors(), id = "pca", threshold = .50)
+
+# pls
+pls_recipe = 
+  norm_recipe |>
+  step_pls(all_numeric_predictors(), outcome = "interaction", id = "pls", num_comp = 5)
+
+
+```
+
+Just to illustrate, I'll take one of these recipes and inspect how interaction varies along with some of the features we have. Looking first at numeric features via a scatterplot. 
+
+```{r}
+
+baked = 
+  expanded_recipe |>
+  prep() |>
+  bake(new_data = NULL)
+
+baked |>
+  select(-starts_with("mechanics_"), -starts_with("categories")) |>
+  pivot_longer(
+    cols = -c(game_id, name, yearpublished, interaction),
+    names_to = c("feature"),
+    values_to = c("value")
+  ) |>
+  ggplot(aes(x=interaction, y=value))+
+  geom_point(size = 0.5)+
+  facet_wrap(feature ~., scales = "free")+
+  geom_smooth(method = 'loess', formula = 'y~x')
+```
+
+Next looking at mechanics. As we would expect, there are certain mechanics that are a dead giveaway that a game will be more interactive, such as Take-That and Area Majority, while other mechanics indicate a game is more of a Euro and less interactive, such as Worker/Tile Placement. This makes me wonder whether a model trained to predict interactivity is really just going to be picking up on the differences between "American" (thematic, conflict) and "European" (economy, efficiency) schools of design?
+
+```{r}
+
+pivot_categorical = function(data) {
+  
+  data |>
+    pivot_longer(
+      cols = -c(game_id, name, yearpublished, interaction),
+      names_to = c("feature"),
+      values_to = c("value")
+    ) |>
+    mutate(value = case_when(value == 1 ~ 'yes', TRUE ~ 'no')) 
+  
+}
+
+plot_categorical = function(data, ncol = 5) {
+  
+  data |>
+    ggplot(aes(x=interaction, y=value, color = value))+
+    # geom_boxplot()+
+    geom_point(size = 0.5, alpha = 0.25, position = ggforce::position_jitternormal(sd_x = 0))+
+    geom_boxplot(alpha = 0.5, outliers = F)+
+    facet_wrap(~bggUtils::present_bgg_text(feature), scales = "free", ncol = ncol)+
+    theme(strip.text.x = element_text(size = 6))+
+    guides(color = 'none')+
+    ylab("feature")+
+    scale_color_viridis_d(begin = 0.8, end = 0) +
+    scale_fill_viridis_d(begin = 0.8, end = 0)
+}
+
+boxplot_categorical = function(data) {
+  
+  data |>
+    filter(value == 'yes') |>
+    mutate(feature = bggUtils::present_bgg_text(feature)) |>
+    group_by(feature) |>
+    mutate(mean_rating = mean(interaction)) |>
+    ungroup() |>
+    ggplot(aes(x=interaction, y=reorder(feature, mean_rating)))+
+    geom_boxplot(alpha = 0.5, outliers = F)+
+    geom_point(size = 0.1, alpha = 0.5, position = ggforce::position_jitternormal(sd_x = 0))+
+    ylab("")+
+    xlab("interaction rating")
+  
+}
+
+dotplot_categorical = function(data) {
+  
+  data |>
+    group_by(feature, value) |> 
+    summarize(mean = mean(interaction)) |> 
+    mutate(feature = bggUtils::present_bgg_text(feature)) |>
+    ggplot(aes(x=mean, y=reorder(feature, mean)))+
+    geom_line(aes(group = feature), color = 'grey60')+
+    geom_point(aes(color = value))+
+    ylab("feature")+
+    xlab("mean interaction rating")
+  
+}
+
+
+baked |>
+  select(game_id, name, yearpublished, interaction, starts_with("mechanics_")) |>
+  pivot_categorical() |>
+  mutate(feature = gsub("^mechanics_", "", feature)) |>
+  boxplot_categorical()+
+  theme_light()+
+  labs(title = "Interactivity by Mechanic")
+
+```
+
+We notice something similar if we look at categories, with Fantasy and Fighting games tending to be more interactive than Economic games. Here we can also notice that certain categories that we would associate with party/social deduction games (Bluffing, Deduction) tend to have higher player interaction.
+
+```{r}
+
+baked |>
+  select(game_id, name, yearpublished, interaction, starts_with("categories_")) |>
+  pivot_categorical() |>
+  mutate(feature = gsub("^categories_", "", feature)) |>
+  boxplot_categorical()+
+  theme_light()+
+  labs(title = "Interactivity by Category")
+
+```
+
+I created a specific recipe just to deal with playercounts - I'm thinking that the best way to handle player counts might be to simply create dummies for individual player counts rather than just use the minimum and maximum player count.
+
+```{r}
+
+playercounts_recipe |>
+  prep() |>
+  bake(new_data = NULL) |>
+  select(game_id, name, interaction, starts_with("player_counts")) |>
+  pivot_longer(cols = starts_with("player_counts"),
+               names_to = c("feature")) |>
+  mutate(value = case_when(value > 0 ~ 'yes',
+                           value < 0 ~ 'no')) |>
+  plot_categorical(ncol = 2)
+
+```
+
+
+## Models
+
+Now create model specifications. I'll use models in the linear family for now, given the amount of data we have to train a model on. I'm just using a simple linear model, as well as a linear model with a penalty (glmnet).
+
+```{r}
+
+lm_mod = linear_reg()
+glmnet_mod = linear_reg(engine = "glmnet", 
+                        penalty = tune::tune())
+
+```
+
+I'll then combine these models with the recipes to create a set of candidate workflows, which I will then tune and evaluate across resampling. I'm evaluating models using standard measures (rmse, rsquared, mape), but I'm also examining the  concordance correlation coefficient (ccc), as I think we really want to balance both accuracy and consistency.
+
+```{r}
+
+wflows = 
+  workflowsets::workflow_set(preproc = list("baseline"  = baseline_recipe,
+                                            "expanded" = expanded_recipe,
+                                            "playercounts" = playercounts_recipe,
+                                            "pca" = pca_recipe,
+                                            "pls" = pls_recipe),
+                             models = list("lm" = lm_mod,
+                                           #  "stan" = stan_mod,
+                                           "glmnet" = glmnet_mod)
+  ) |>
+  anti_join(
+    tibble(wflow_id = c("pls_glmnet", "pca_glmnet")),
+    by = "wflow_id"
+  )
+```
+
+## Results
+
+I'll now examine how each of these workflows performed during resampling.
+
+```{r}
+#| warning: false
+set.seed(1999)
+models = 
+  wflows |>
+  workflow_map(fn = "tune_grid",
+               resamples = folds,
+               verbose = T,
+               grid = 15,
+               metrics = metric_set(rmse, rsq, mape, ccc),
+               control = control_grid(save_pred = T, save_workflow = T)
+  )
+
+```
+
+How did they all do? I'll just grab the resulting performance for every candidate model and plot it for each metric. 
+
+```{r}
+#| warning: false
+#| message: false
+models |>
+  autoplot(type = "wflow_id")+
+  theme_light()
+
+```
+
+Notice that there are more workflows shown in the plot than the ones that I fit - this is because for each of the glmnet models we are further evaluating a set of candidate models over its tuning parameter.
+
+I'll just extract the best performing model for each workflow and see how it performs across these metrics. Right now, the best performing model via resampling is the penalized model that includes a dummy for specific playercounts.
+
+```{r}
+
+models |> 
+  rank_results(select_best = T, rank_metric = "ccc") |>
+  select(wflow_id, .metric, mean, std_err, n, rank) |>
+  gt_tbl()|>
+  gt::fmt_number(columns = c("mean", "std_err"), decimals = 3)
+```
+
+
+I'll extract predictions from the models and compare the predictions to the actual.
+
+```{r}
+
+models |>
+  collect_predictions(select_best = T, metric = 'ccc') |>
+  left_join(
+    split |>
+      training() |>
+      mutate(.row = row_number()) |>
+      select(game_id, name, .row)
+  ) |>
+  select(wflow_id, game_id, name, .row, .pred, interaction) |>
+  ggplot(aes(x=.pred, y=interaction))+
+  geom_point(size = 0.5)+
+  facet_wrap(~wflow_id)+
+  theme_light()+
+  ggpubr::stat_cor()+
+  geom_abline(slope = 1, linetype = 'dashed')
+
+
+```
+
+The best performing model at this stage is the penalized regression with playercount dummies. I'll fit this model to the entirety of the training set to grab the coefficients and get a sense of what it's learning from the data. I'll also add a model postprocessor to constrain predictions between 1 and 5.
+
+Looking at the coefficients, we can see (as before) that certain mechanics (Take That, Area Majority), categories (Deduction, Territory Building), and player counts (5 players) are associated with higher interactivity ratings. Mechanics associated with Euro style games (End Game Bonuses, Tile Placement) and low player counts (x2, x3) tend to reduce interactivity.
+
+```{r}
+
+# fit 
+best_mod = 
+  models |>
+  fit_best(metric = "ccc")  |>
+  add_tailor(
+    tailor() |>
+      adjust_numeric_range(lower_limit = 1, upper_limit = 5)
+  )
+
+# extract coefs
+best_mod |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  slice_max(abs(estimate), n = 35) |>
+  mutate(sign = case_when(estimate > 0 ~ 'increases interactivity',
+                          estimate < 0 ~ 'decreases interactivity')) |>
+  mutate(tidy_term = bggUtils::present_bgg_text(term)) |>
+  ggplot(aes(y=reorder(tidy_term, estimate),
+             x=estimate))+
+  geom_col()+
+  ylab("")+
+  facet_wrap(~sign, scales = "free_x")
+
+```
+
+I'll then use this model to predict the validation set. We'd like to see the our estimated interactive rating be pretty close to the actual here.
+
+```{r}
+
+valid_preds = 
+  best_mod |>
+  augment(
+    split |>
+      testing()
+  )
+
+plot_predictions = function(data) {
+  
+  data |>
+    ggplot(aes(x=.pred, y=interaction, label = name))+
+    geom_point(size = 1.5)+
+    geom_text(size = 1.5, vjust = 1.5)+
+    coord_cartesian(xlim = c(0.5, 5.5), ylim = c(0.5, 5.5))+
+    geom_abline(slope = 1,
+                linetype = 'dashed')+
+    xlab("estimated interactivity")+
+    ylab("actual interactivity")+
+    ggpubr::stat_cor()
+  
+}
+
+valid_preds |> 
+  ggplot(aes(x=.pred, y=interaction, label = name))+
+  geom_point(size = 1.5)+
+  geom_text(size = 1.5, vjust = 1.5)+
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(0.5, 5.5))+
+  geom_abline(slope = 1,
+              linetype = 'dashed')+
+  xlab("estimated interactivity")+
+  ylab("actual interactivity")+
+  ggpubr::stat_cor()
+
+```
+
+The biggest misses for this version of the model look to be Rairoad Ink and Troyes. I'd guess that the model thinks Railroad Ink has more interaction than it does because it has a low play time and can play at higher playercounts?
+
+Troyes I can see a model failing to pick up on - on paper it's a dry Euro game, but it's actually quite interactive because of the manners in you can buy each other's dice.
+
+Overall, the model's performance on the validation set is in line with what we found during resampling.
+
+```{r}
+
+metrics = metric_set(rmse, rsq, mape, rsq)
+
+best_mod |>
+  augment(
+    split |>
+      testing()
+  ) |>
+  metrics(
+    interaction,
+    .pred
+  ) |>
+  mutate_if(is.numeric, round, 3) |>
+  gt_tbl()
+
+```
+
+I'll use resampling with this model across the entirety of the data we have for interactivity to get out of sample predictions for every game.
+
+```{r}
+set.seed(1999)
+folds_all = split$data |> vfold_cv(strata = interaction, repeats = 3)
+
+oos_preds = 
+  best_mod |>
+  fit_resamples(resamples = folds_all,
+                control = control_resamples(save_pred = T))
+
+oos_estimates = 
+  oos_preds |>
+  collect_predictions(summarize = T) |>
+  select(.row, .pred) |>
+  left_join(
+    split$data |>
+      mutate(.row = row_number()) |>
+      select(.row, game_id, name, yearpublished, interaction)
+  )
+```
+
+
+```{r}
+
+oos_estimates |>
+  plot_predictions()
+
+```
+
+
+```{r}
+
+
+estimates_tbl = function(data){
+  
+  data |>
+    arrange(desc(interaction)) |>
+    gt_tbl() |>
+    gt::data_color(columns = c("estimate", "interaction"),
+                   method = "numeric",
+                   palette = "viridis",
+                   domain = c(1, 5),
+                   reverse = T) |>
+    gt::cols_align(columns = c("estimate", "interaction"),
+                   align = "center") |>
+    gt::opt_interactive()
+}
+
+
+oos_estimates |>
+  mutate_if(is.numeric, round, 3) |>
+  select(game_id, name, estimate = .pred, interaction) |>
+  arrange(desc(interaction)) |>
+  estimates_tbl()
+
+```
+
+
+# Estimates
+
+Now on to the task of estimating games for which we do not have ratings. I'll take the best performing model, fit it to the entirety of the data for which we have interaction ratings, and then predict games for which we do not.
+
+```{r}
+
+best_fit = 
+  best_mod |>
+  fit(
+    split$data
+  )
+
+estimates = 
+  best_fit |>
+  predict(
+    games_preprocessed 
+  ) |>
+  bind_cols(
+    games_preprocessed
+  )
+
+```
+
+The following plot shows the distribution of estimated interactivity for all games. Note that there's a bit of an uptick at 5 due to the fact that we're capping the rating at 5.
+
+```{r}
+
+estimates |>
+  rename(interaction = .pred) |>
+  ggplot(aes(x=interaction))+
+  geom_histogram(bins = 80)
+
+```
+
+How does (estimated) interactivity compare to complexity?
+
+These two aren't expected to have a relationship, but I just want to see the "universe" of games based on these two dimensions. 
+
+```{r}
+#| message: false
+#| warning: false
+#| 
+estimates |>
+  select(game_id, name, averageweight, interaction = .pred) |>
+  ggplot(aes(x=averageweight, y=interaction, label = name))+
+  geom_point(size = 0.5, alpha = 0.25, position = ggforce::position_jitternormal())+
+  geom_text(check_overlap = T, size = 1.5)+
+  ylab("estimated interaction")
+
+
+```
+
+## The Top 100
+
+Maybe the quickest way to just get a sense of the interaction rating is to zoom in on a set of well-known games. Let's look at the estimated interactivity rating for the BGG Top 100. 
+
+```{r}
+top_100 = 
+  estimates |>
+  rename(interaction = .pred) |>
+  slice_max(bayesaverage, n = 100) |>
+  select(game_id, name, geek_rating = bayesaverage, interaction) |>
+  mutate_if(is.numeric, round, 3) |>
+  arrange(interaction)
+
+```
+
+Which games in the top 100 are considered the least interactive? Everdell, Castles of Burgundy, On Mars, Ark Nova. We basically get a list of Euro style games that are a bit more on the multiplayer solitaire side.
+
+```{r}
+
+top_100 |>
+  gt_tbl() |>
+  gt::opt_interactive() |>
+  gt::data_color(columns = c("interaction"),
+                 method = "numeric",
+                 palette = "viridis",
+                 domain = c(1, 5),
+                 reverse = T) |>
+  gt::cols_align(columns = c("interaction", "geek_rating"),
+                 align = "center") |>
+  gt::opt_interactive()
+
+```
+
+Which games in the top 100 are considered the most interactive? TI4, Root, Eclipse, War of the Ring. Interactivity, in this case, is really picking up on the war/conflict side of things, though Five Tribes is one that's a lot higher up there than I would have expected?
+
+```{r}
+
+top_100 |>
+  arrange(desc(interaction)) |>
+  gt_tbl() |>
+  gt::opt_interactive() |>
+  gt::data_color(columns = c("interaction"),
+                 method = "numeric",
+                 palette = "viridis",
+                 domain = c(1, 5),
+                 reverse = T) |>
+  gt::cols_align(columns = c("interaction", "geek_rating"),
+                 align = "center") |>
+  gt::opt_interactive()
+
+```
+
+## Top 1000
+
+Finally, here's the top 1000 games on BGG (just to make this table easier to) to sort through and examine along with other BGG ratings.
+
+```{r}
+
+estimates |>
+  slice_max(bayesaverage, n = 1000) |>
+  select(game_id, name, interaction = .pred, geek_rating = bayesaverage, averageweight, average) |>
+  mutate_if(is.numeric, round, 3) |>
+  gt_tbl() |>
+  gt::opt_interactive() |>
+  gt::data_color(columns = c("interaction"),
+                 method = "numeric",
+                 palette = "viridis",
+                 domain = c(1, 5),
+                 reverse = T) |>
+  gt::cols_align(columns = c("interaction", "geek_rating", "averageweight"),
+                 align = "center") |>
+  gt::opt_interactive()
+```
+
+I'll also write out these estimates and save them to a CSV.
+
+```{r}
+
+estimates |>
+  select(game_id, name, interaction = .pred) |>
+  write.csv(file = "data/processed/estimates.csv")
+```
+
