@@ -5,6 +5,8 @@ format:
     warning: false
     message: false
 editor: source
+execute:
+  freeze: auto
 ---
 
 # Data
@@ -46,18 +48,7 @@ theme_set(bggUtils::theme_bgg())
 
 ## Responses
 
-The responses data has one record for each game from a respondent, with a rating ranging from 1 to 5.
-
-```{r}
-
-set.seed(10)
-responses |>
-  filter(!is.na(response_rating)) |>
-  mutate(response_ts = as.Date(response_ts)) |>
-  sample_n(15) |>
-  gt_tbl()
-```
-
+The responses data has one record for each game from a respondent, with a rating ranging from 1 to 5. I can aggregate this to create a table with the number of votes for each rating, along with its mean and standard deviation.
 
 ```{r}
 
@@ -90,9 +81,9 @@ responses |>
 
 ```
 
-## Table
+## Interaction Table
 
-The responses are slightly different than data shown in the `Interaction Table` sheet, which has more responses from, I'm guessing, previous surveys? Nonetheless this can be analyzed in a similar fashion.
+The responses document is slightly different than data shown in the `Interaction Table` sheet, which has more responses from, I'm guessing, previous surveys? Nonetheless this can be analyzed in a similar fashion.
 
 ```{r}
 
@@ -115,6 +106,8 @@ interaction_table |>
   plot_mean_vs_sd()
 
 ```
+
+This table has more data to work with, so I'm going to proceed using this rather than the raw responses, but this is something that can be easily flipped.
 
 # Analysis
 
@@ -458,6 +451,7 @@ I'll now examine how each of these workflows performed during resampling.
 
 ```{r}
 #| warning: false
+#| cache: true
 set.seed(1999)
 models = 
   wflows |>
